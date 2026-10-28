@@ -1,23 +1,29 @@
-"""PHASE 3 + client side of PHASE 5 (owner: Tanishq) - minimal terminal client.
+"""PHASES 3 + 5 + 6 (owner: Tanishq) - terminal client with automatic reconnect.
 
   python -m client.cli --host 127.0.0.1 --port 9000 --name alice
 Commands (line numbers start at 1):  show | r N text | i N text | a text | d N [M] | sync | help | quit
-When the server rejects an edit (someone else got there first) the client re-fetches the document
-and tells you to redo the edit. It never overwrites silently.
+ * the server tells us the APPLIED line range in every ack/update, so our copy stays exact even when the
+   server shifted our edit past other people's edits (phase 8)
+ * on a conflict we re-fetch the document and print a difflib diff of what changed (phase 5)
+ * if the connection drops we reconnect by ourselves (0.5s, 1s, 2s ... max 5s) and show the current document (phase 6)
 """
 import argparse
 import asyncio
+import difflib
 import sys
 
 from common import protocol as P
 
 HELP = "show | r N text (replace) | i N text (insert before N) | a text (append) | d N [M] (delete) | sync | quit"
+EDIT_COMMANDS = ("a", "r", "i", "d")
 
 
 class Client:
     def __init__(self, name):
         self.name, self.lines, self.version = name, [], 0
         self.writer, self.pending, self.req = None, {}, 0
+        self.diff_base = None            # our text before a conflicting edit, to diff against after the re-fetch
+        self.quit = False
 
     def send(self, msg):
         self.writer.write(P.encode_message(msg))
@@ -25,45 +31,63 @@ class Client:
     def show(self):
         print("\n".join(f"{i + 1:>3} | {t}" for i, t in enumerate(self.lines)) or "(empty document)")
 
+    def print_diff(self, old, new):
+        diff = list(difflib.unified_diff(old, new, "before", "server now", lineterm="", n=1))
+        print("\n".join("    " + d for d in diff) if diff else "    (no difference)")
+
     def handle(self, m):
         t = m["type"]
         if t == P.SNAPSHOT:
             self.lines, self.version = list(m["lines"]), m["version"]
-            print(f"* document at version {self.version}")
-            self.show()
+            if self.diff_base is not None:
+                print(f"* document refreshed (v{self.version}). What changed since you started your edit:")
+                self.print_diff(self.diff_base, self.lines)
+                print("  Redo your edit if it still makes sense.")
+                self.diff_base = None
+            else:
+                print(f"* document at version {self.version}")
+                self.show()
         elif t == P.UPDATE:
+            s, e, new = m["start_line"], m["end_line"], m["new_lines"]
             if m["version"] == self.version + 1:
-                self.lines[m["start_line"]:m["end_line"]] = m["new_lines"]
+                self.lines[s:e] = new
                 self.version = m["version"]
-                print(f"* {m['author']} changed lines {m['start_line'] + 1}-{max(m['end_line'], m['start_line'] + len(m['new_lines']))} (v{self.version})")
+                print(f"* {m['author']} changed lines {s + 1}-{max(e, s + len(new))} (v{self.version})")
             elif m["version"] > self.version + 1:
                 print("* missed an update, re-fetching")
                 self.send({"type": P.SYNC})
         elif t == P.ACK:
-            start, end, new = self.pending.pop(m["req_id"], (0, 0, []))
+            entry = self.pending.pop(m["req_id"], None)
+            if entry is None:
+                return
+            new = entry[2]
+            s, e = m["start_line"], m["end_line"]            # the range the server APPLIED
             if m["version"] == self.version + 1:
-                self.lines[start:end] = new
+                self.lines[s:e] = new
                 self.version = m["version"]
-                print(f"ok (v{self.version})")
-            else:
+                note = " (an earlier edit landed first; yours was moved to the right place)" if m.get("rebased") else ""
+                print(f"ok (v{self.version}){note}")
+            elif m["version"] > self.version + 1:
                 self.send({"type": P.SYNC})
         elif t == P.REJECT:
-            self.pending.pop(m["req_id"], None)
-            print(f"REJECTED ({m['reason']}): {m.get('detail', '')}")
-            if m["reason"] == "stale_version":
-                print("  someone edited first - re-fetching the latest; redo your edit if it still makes sense")
+            entry = self.pending.pop(m["req_id"], None)
+            if m["reason"] in ("conflict", "stale_version"):
+                print("CONFLICT: someone else changed those lines first, so your edit was NOT applied. Re-fetching...")
+                self.diff_base = entry[3] if entry else list(self.lines)
                 self.send({"type": P.SYNC})
+            else:
+                print(f"REJECTED ({m['reason']}): {m.get('detail', '')}")
         elif t == P.ERROR:
             print(f"server error: {m.get('reason')}")
 
     def edit(self, start, end, new):
         self.req += 1
-        self.pending[self.req] = (start, end, new)
+        self.pending[self.req] = (start, end, new, list(self.lines))
         self.send({"type": P.EDIT, "req_id": self.req, "base_version": self.version,
                    "start_line": start, "end_line": end, "new_lines": new})
 
     def command(self, text):
-        """Returns False to quit."""
+        """Run one typed command. Returns False to quit."""
         parts, n = text.strip().split(None, 2), len(self.lines)
         if not parts:
             return True
@@ -71,7 +95,9 @@ class Client:
         try:
             if cmd in ("quit", "q", "exit"):
                 return False
-            if cmd == "help":
+            if cmd in EDIT_COMMANDS + ("sync",) and self.writer is None:
+                print("not connected - nothing was sent. Waiting for the server to come back...")
+            elif cmd == "help":
                 print(HELP)
             elif cmd == "show":
                 self.show()
@@ -104,36 +130,52 @@ class Client:
 
 async def amain(args):
     c = Client(args.name)
-    try:
-        reader, c.writer = await asyncio.open_connection(args.host, args.port)
-    except OSError as e:
-        sys.exit(f"cannot connect to {args.host}:{args.port}: {e}")
-    c.send({"type": P.HELLO, "client_id": args.name})
-
-    async def receive():
-        while True:
-            try:
-                m = await P.read_message(reader)
-            except P.ProtocolError as e:
-                print(f"protocol error: {e}")
-                break
-            if m is None:
-                print("* server closed the connection")
-                break
-            c.handle(m)
-    task = asyncio.create_task(receive())
     loop = asyncio.get_running_loop()
+
+    async def read_commands():
+        while not c.quit:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line or not c.command(line):
+                c.quit = True
+                if c.writer:
+                    c.writer.close()
+                return
+
+    stdin_task = asyncio.create_task(read_commands())
     print(HELP)
-    while not task.done():
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line or not c.command(line):
-            break
-    c.writer.close()
-    task.cancel()
+    delay = 0.5
+    while not c.quit:
+        try:
+            reader, writer = await asyncio.open_connection(args.host, args.port)
+        except OSError:
+            print(f"* cannot reach the server, retrying in {delay:.1f}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 5)
+            continue
+        c.writer, delay = writer, 0.5
+        c.send({"type": P.HELLO, "client_id": args.name})
+        try:
+            while True:
+                m = await P.read_message(reader)
+                if m is None:
+                    break
+                c.handle(m)
+        except (P.ProtocolError, ConnectionError, OSError) as e:
+            print(f"* connection problem: {e}")
+        finally:
+            c.writer = None
+            writer.close()
+            if c.pending:
+                print("* an edit was in flight when the connection dropped - type 'show' to check whether it landed")
+                c.pending.clear()
+        if not c.quit:
+            print("* disconnected, reconnecting...")
+            await asyncio.sleep(delay)
+    stdin_task.cancel()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CollabFS client (V1)")
+    ap = argparse.ArgumentParser(description="CollabFS client")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--name", required=True, help="letters, digits, _ . - (max 32)")
