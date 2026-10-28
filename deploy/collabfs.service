@@ -1,0 +1,27 @@
+[Unit]
+Description=CollabFS collaborative file server
+After=network.target
+
+[Service]
+Type=simple
+User=collabfs
+Group=collabfs
+WorkingDirectory=/opt/collabfs
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m server.server --host 0.0.0.0 --port 9000 --state /var/lib/collabfs/state.json
+# SIGTERM (what "systemctl stop" sends) makes the server save the document before it exits
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=2
+SyslogIdentifier=collabfs
+# creates /var/lib/collabfs, owned by the service user
+StateDirectory=collabfs
+# the service only needs the network and its own state directory
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
