@@ -1,13 +1,15 @@
-"""PHASE 2 skeleton + PHASE 5 broadcast (owner: Monali; Tanishq reviews / co-owns phase 5).
+"""PHASES 2, 5, 6 (owner: Monali) - asyncio server: hello/snapshot, ack/update/reject broadcast, state file.
 
-Run:  python -m server.server --host 0.0.0.0 --port 9000
+Run:  python -m server.server --host 0.0.0.0 --port 9000 --state state.json
 One asyncio event loop; the edit handler has no `await`, so two edits can never interleave.
 """
 import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import tempfile
 
 from common import protocol as P
 from .document import Document, EditRejected
@@ -16,12 +18,31 @@ log = logging.getLogger("collabfs")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 
 
+def write_atomic(path, text):
+    """Write to a temp file, then rename: a crash can never leave a half-written state file."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 class CollabServer:
-    def __init__(self, host="127.0.0.1", port=9000):
-        self.doc = Document()
+    def __init__(self, host="127.0.0.1", port=9000, state_path=None, save_interval=1.0):
+        self.state_path, self.save_interval = state_path, save_interval
+        self.doc = Document.load(state_path) if state_path else Document()
         self.host, self._port = host, port
         self.sessions: dict[str, asyncio.StreamWriter] = {}
         self._server = None
+        self._saver = None
+        self._dirty = False
 
     @property
     def port(self):
@@ -29,13 +50,36 @@ class CollabServer:
 
     async def start(self):
         self._server = await asyncio.start_server(self._handle_client, self.host, self._port)
-        log.info("listening on %s:%d", self.host, self.port)
+        if self.state_path:
+            self._saver = asyncio.create_task(self._save_loop())
+        log.info("listening on %s:%d (document v%d, %d lines)", self.host, self.port,
+                 self.doc.version, len(self.doc.lines))
 
     async def stop(self):
         self._server.close()
         for w in list(self.sessions.values()):
             w.close()
+        if self._saver:
+            self._saver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._saver
+            await self._flush()
         await self._server.wait_closed()
+        log.info("server stopped at version %d", self.doc.version)
+
+    async def _flush(self):
+        if self._dirty and self.state_path:
+            self._dirty = False
+            await asyncio.to_thread(write_atomic, self.state_path, self.doc.to_json())
+
+    async def _save_loop(self):          # saves at most once per second, off the event loop
+        while True:
+            await asyncio.sleep(self.save_interval)
+            try:
+                await self._flush()
+            except OSError:
+                self._dirty = True
+                log.exception("could not save state; will retry")
 
     def _send(self, writer, msg):
         if not writer.is_closing():
@@ -91,38 +135,58 @@ class CollabServer:
 
     def _on_edit(self, client_id, writer, msg):
         req_id = msg.get("req_id")
-        s, e, new = msg.get("start_line"), msg.get("end_line"), msg.get("new_lines")
         try:
-            version = self.doc.apply_edit(msg.get("base_version"), s, e, new)
+            version, s, e, rebased = self.doc.apply_edit(msg.get("base_version"), msg.get("start_line"),
+                                                         msg.get("end_line"), msg.get("new_lines"))
         except EditRejected as err:
             log.info("REJECT %s from %s (%s)", err.reason, client_id, err.detail)
             self._send(writer, {"type": P.REJECT, "req_id": req_id, "reason": err.reason,
                                 "detail": err.detail, "current_version": self.doc.version})
             return
-        log.info("ACCEPT v%d from %s: lines [%d,%d) -> %d line(s)", version, client_id, s, e, len(new))
-        self._send(writer, {"type": P.ACK, "req_id": req_id, "version": version})
+        new = msg["new_lines"]
+        self._dirty = True
+        log.info("ACCEPT v%d from %s: lines [%d,%d) -> %d line(s)%s", version, client_id, s, e, len(new),
+                 " (shifted)" if rebased else "")
+        # the ACK and the UPDATE carry the APPLIED line range, which can differ from what the client sent
+        self._send(writer, {"type": P.ACK, "req_id": req_id, "version": version,
+                            "start_line": s, "end_line": e, "rebased": rebased})
         self._broadcast({"type": P.UPDATE, "version": version, "author": client_id,
                          "start_line": s, "end_line": e, "new_lines": new}, exclude=writer)
 
 
+class JournaldFormatter(logging.Formatter):
+    """Prefix syslog priority so `journalctl -p warning` works; journald adds the timestamp."""
+    PRIO = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4, logging.ERROR: 3, logging.CRITICAL: 2}
+
+    def format(self, record):
+        return f"<{self.PRIO.get(record.levelno, 6)}>" + super().format(record)
+
+
 async def _run(args):
     import signal
-    srv = CollabServer(args.host, args.port)
+    srv = CollabServer(args.host, args.port, args.state)
     await srv.start()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM):          # SIGTERM = what systemd sends on stop
         loop.add_signal_handler(sig, stop.set)
     await stop.wait()
     await srv.stop()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CollabFS server (V1)")
+    ap = argparse.ArgumentParser(description="CollabFS server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
+    ap.add_argument("--state", default=None, help="file that keeps the document across restarts")
+    ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    handler = logging.StreamHandler()
+    if os.environ.get("JOURNAL_STREAM"):                 # running under systemd
+        handler.setFormatter(JournaldFormatter("%(name)s: %(message)s"))
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.basicConfig(level=args.log_level.upper(), handlers=[handler])
     asyncio.run(_run(args))
 
 
