@@ -14,7 +14,7 @@ import sys
 
 from common import protocol as P
 
-HELP = "show | r N text (replace) | i N text (insert before N) | a text (append) | d N [M] (delete) | sync | quit"
+HELP = "show | r N text (replace) | i N text (insert before N) | a text (append) | d N [M] (delete) | sync | lag N (demo: fake slow network) | quit"
 EDIT_COMMANDS = ("a", "r", "i", "d")
 
 
@@ -24,6 +24,7 @@ class Client:
         self.writer, self.pending, self.req = None, {}, 0
         self.diff_base = None            # our text before a conflicting edit, to diff against after the re-fetch
         self.quit = False
+        self.lag = 0.0                   # demo only: delay other people's updates to fake a slow network
 
     def send(self, msg):
         self.writer.write(P.encode_message(msg))
@@ -68,6 +69,7 @@ class Client:
                 note = " (an earlier edit landed first; yours was moved to the right place)" if m.get("rebased") else ""
                 print(f"ok (v{self.version}){note}")
             elif m["version"] > self.version + 1:
+                print(f"ok (v{m['version']}) - accepted; others edited meanwhile, refreshing your copy")
                 self.send({"type": P.SYNC})
         elif t == P.REJECT:
             entry = self.pending.pop(m["req_id"], None)
@@ -97,6 +99,9 @@ class Client:
                 return False
             if cmd in EDIT_COMMANDS + ("sync",) and self.writer is None:
                 print("not connected - nothing was sent. Waiting for the server to come back...")
+            elif cmd == "lag":               # demo only
+                self.lag = float(parts[1]) if len(parts) > 1 else 0.0
+                print(f"* demo: updates from others are now delayed by {self.lag}s" if self.lag else "* demo lag off")
             elif cmd == "help":
                 print(HELP)
             elif cmd == "show":
@@ -159,7 +164,10 @@ async def amain(args):
                 m = await P.read_message(reader)
                 if m is None:
                     break
-                c.handle(m)
+                if c.lag and m["type"] == P.UPDATE:      # demo only: deliver other people's edits late
+                    asyncio.get_running_loop().call_later(c.lag, c.handle, m)
+                else:
+                    c.handle(m)
         except (P.ProtocolError, ConnectionError, OSError) as e:
             print(f"* connection problem: {e}")
         finally:
