@@ -42,6 +42,7 @@ class CollabServer:
         self.sessions: dict[str, asyncio.StreamWriter] = {}
         self._server = None
         self._saver = None
+        self._stopping = None
         self._dirty = False
 
     @property
@@ -51,6 +52,7 @@ class CollabServer:
     async def start(self):
         self._server = await asyncio.start_server(self._handle_client, self.host, self._port)
         if self.state_path:
+            self._stopping = asyncio.Event()
             self._saver = asyncio.create_task(self._save_loop())
         log.info("listening on %s:%d (document v%d, %d lines)", self.host, self.port,
                  self.doc.version, len(self.doc.lines))
@@ -60,25 +62,28 @@ class CollabServer:
         for w in list(self.sessions.values()):
             w.close()
         if self._saver:
-            self._saver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._saver
-            await self._flush()
+            self._stopping.set()
+            await self._saver          # let a save that is already running finish: never cancel a write half-way
+            await self._flush()        # then write whatever is still unsaved
         await self._server.wait_closed()
         log.info("server stopped at version %d", self.doc.version)
 
     async def _flush(self):
         if self._dirty and self.state_path:
             self._dirty = False
-            await asyncio.to_thread(write_atomic, self.state_path, self.doc.to_json())
+            try:
+                await asyncio.to_thread(write_atomic, self.state_path, self.doc.to_json())
+            except BaseException:
+                self._dirty = True
+                raise
 
     async def _save_loop(self):          # saves at most once per second, off the event loop
-        while True:
-            await asyncio.sleep(self.save_interval)
+        while not self._stopping.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):      # wake up every save_interval, or at once on stop
+                await asyncio.wait_for(self._stopping.wait(), self.save_interval)
             try:
                 await self._flush()
             except OSError:
-                self._dirty = True
                 log.exception("could not save state; will retry")
 
     def _send(self, writer, msg):
